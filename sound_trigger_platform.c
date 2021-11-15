@@ -6241,7 +6241,7 @@ int platform_stdev_update_bad_mic_channel_index
          return ret;
     }
 
-    if (popcount(bad_mic_channel_index) > 1) {
+    if (__builtin_popcount(bad_mic_channel_index) > 1) {
         ALOGE("%s: bad mic channel index popcount more than one 0x%x",
                __func__, bad_mic_channel_index);
          ret = -EINVAL;
