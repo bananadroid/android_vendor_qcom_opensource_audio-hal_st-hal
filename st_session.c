@@ -184,7 +184,7 @@ void hw_sess_cb(st_hw_sess_event_t *hw_event, void *cookie)
             lock_status = pthread_mutex_trylock(&st_ses->lock);
         } while (lock_status && !st_ses->device_disabled &&
                  (st_ses->exec_mode != ST_EXEC_MODE_NONE) &&
-                 (st_ses->current_state != ssr_state_fn));
+                 (st_ses->current_state == active_state_fn));
 
         if (st_ses->device_disabled) {
             ALOGV("%s:[%d] device switch in progress, ignore event",
@@ -192,8 +192,8 @@ void hw_sess_cb(st_hw_sess_event_t *hw_event, void *cookie)
         } else if (st_ses->exec_mode == ST_EXEC_MODE_NONE) {
             ALOGV("%s:[%d] transition in progress, ignore event",
                   __func__, st_ses->sm_handle);
-        } else if (st_ses->current_state == ssr_state_fn) {
-            ALOGV("%s:[%d] SSR handling in progress, ignore event",
+        } else if (st_ses->current_state != active_state_fn) {
+            ALOGV("%s:[%d] Session not in active state, ignore event",
                   __func__, st_ses->sm_handle);
         } else if (!lock_status) {
             /*
@@ -239,7 +239,8 @@ void hw_sess_cb(st_hw_sess_event_t *hw_event, void *cookie)
         if (st_ses->det_stc_ses->pending_stop) {
             ALOGV("%s:[%d] pending stop already queued, ignore event",
                 __func__, st_ses->sm_handle);
-        } else if (!st_ses->det_stc_ses->detection_sent) {
+        } else if (!lock_status && !st_ses->det_stc_ses->detection_sent &&
+                    st_ses->current_state == buffering_state_fn) {
                 ev.ev_id = ST_SES_EV_RESTART;
                 DISPATCH_EVENT(st_ses, ev, status);
                 ALOGV("%s:[%d] client callback hasn't been called, restart detection evt_id(%d)",
@@ -2523,7 +2524,8 @@ static int update_hw_config_on_start(st_session_t *stc_ses,
                 }
                 if (param_hdr->payload_size != conf_levels_payload_size) {
                     ALOGE("%s: Conf level format error, exiting", __func__);
-                    return -EINVAL;
+                    status = -EINVAL;
+                    goto ERR_EXIT;
                 }
                 status = parse_rc_config_key_conf_levels(stc_ses, st_hw_ses,
                     opaque_ptr, &conf_levels, &num_conf_levels);
@@ -2534,7 +2536,8 @@ static int update_hw_config_on_start(st_session_t *stc_ses,
                 if (status) {
                     ALOGE("%s: parsing conf levels failed(status=%d)",
                         __func__, status);
-                    return -EINVAL;
+                    status = -EINVAL;
+                    goto ERR_EXIT;
                 }
                 break;
             case ST_PARAM_KEY_HISTORY_BUFFER_CONFIG:
@@ -2542,7 +2545,8 @@ static int update_hw_config_on_start(st_session_t *stc_ses,
                     sizeof(struct st_hist_buffer_info)) {
                     ALOGE("%s: History buffer config format error, exiting",
                           __func__);
-                    return -EINVAL;
+                    status = -EINVAL;
+                    goto ERR_EXIT;
                 }
                 hist_buf = (struct st_hist_buffer_info *)(opaque_ptr +
                     sizeof(struct st_param_header));
@@ -2562,7 +2566,8 @@ static int update_hw_config_on_start(st_session_t *stc_ses,
                 if (param_hdr->payload_size !=
                     sizeof(struct st_det_perf_mode_info)) {
                     ALOGE("%s: Opaque data format error, exiting", __func__);
-                    return -EINVAL;
+                    status = -EINVAL;
+                    goto ERR_EXIT;
                 }
                 det_perf_mode = (struct st_det_perf_mode_info *)(opaque_ptr +
                     sizeof(struct st_param_header));
@@ -2575,7 +2580,8 @@ static int update_hw_config_on_start(st_session_t *stc_ses,
                 break;
             default:
                 ALOGE("%s: Unsupported opaque data key id, exiting", __func__);
-                return -EINVAL;
+                status = -EINVAL;
+                goto ERR_EXIT;
             }
         }
     } else if (stc_ses->sm_type == SOUND_MODEL_TYPE_KEYPHRASE) {
@@ -2609,7 +2615,8 @@ static int update_hw_config_on_start(st_session_t *stc_ses,
         stc_ses->sm_info.model_id);
     if (!sthw_cfg) {
         ALOGE("%s: Unexpected, no matching sthw_cfg", __func__);
-        return -EINVAL;
+        status = -EINVAL;
+        goto ERR_EXIT;
     }
 
     if (stc_ses->f_stage_version == ST_MODULE_TYPE_GMM) {
@@ -2633,7 +2640,8 @@ static int update_hw_config_on_start(st_session_t *stc_ses,
             if (num_conf_levels != stc_ses->sm_info.cf_levels_size) {
                 ALOGE("%s: Unexpected, client cf levels %d != sm_info cf levels %d",
                     __func__, num_conf_levels, stc_ses->sm_info.cf_levels_size);
-                return -EINVAL;
+                status = -EINVAL;
+                goto ERR_EXIT;
             }
 
             /*
@@ -2777,6 +2785,12 @@ static int update_hw_config_on_start(st_session_t *stc_ses,
     ALOGD("%s:[%d] lab enabled %d", __func__, st_ses->sm_handle,
           st_ses->lab_enabled);
 
+    return status;
+
+ERR_EXIT:
+    if (conf_levels) {
+        free(conf_levels);
+    }
     return status;
 }
 
@@ -2947,9 +2961,19 @@ static int start_hw_session(st_proxy_session_t *st_ses, st_hw_session_t *hw_ses,
         hw_ses->lpi_enable = hw_ses->stdev->lpi_enable;
         hw_ses->barge_in_mode = hw_ses->stdev->barge_in_mode;
         do_unload = true;
-        platform_stdev_reset_backend_cfg(hw_ses->stdev->platform);
+        /*
+         * When LSM is in buffering state and if we remove the power
+         * cable it will change the battery status. So LPI mode switch from
+         * NLPI to LPI should happen as a part of handle_battery_status_change().
+         * As session is in buffering state,we can't directly change the LPI mode,
+         * so change the mode for subsequent detections, for that we have to reset
+         * backend when next detection is triggered.
+         */
+        if (hw_ses->stdev->is_buffering) {
+            platform_stdev_reset_backend_cfg(hw_ses->stdev->platform);
+            hw_ses->stdev->is_buffering = false;
+        }
     }
-
     /*
      * For gcs sessions, uid may be changed for new capture device,
      * in this case, sm must be dereg and reg again.
@@ -3147,6 +3171,7 @@ static int get_first_stage_detection_params(st_proxy_session_t *st_ses,
                     GENERIC_DET_EVENT_HEADER_SIZE);
                 hw_ses->kw_start_idx = result_info->keyword_start_idx_bytes;
                 hw_ses->kw_end_idx = result_info->keyword_end_idx_bytes;
+                hw_ses->channel_idx = result_info->best_channel_idx;
                 break;
 
             case KEY_ID_CONFIDENCE_LEVELS:
@@ -3178,6 +3203,11 @@ static int get_first_stage_detection_params(st_proxy_session_t *st_ses,
                     GENERIC_DET_EVENT_KW_START_OFFSET);
                 hw_ses->kw_end_idx = *((uint32_t *)payload_ptr +
                     GENERIC_DET_EVENT_KW_END_OFFSET);
+                break;
+
+            case KEY_ID_KEYWORD_CHANNEL_INDEX:
+                hw_ses->channel_idx = *((uint32_t *)payload_ptr +
+                     GENERIC_DET_EVENT_CHANNEL_IDX_OFFSET);
                 break;
 
             case KEY_ID_TIMESTAMP_INFO:
@@ -3225,8 +3255,8 @@ static int get_first_stage_detection_params(st_proxy_session_t *st_ses,
     kw_start_ms = convert_bytes_to_ms(hw_ses->kw_start_idx, &hw_ses->config);
     kw_end_ms = convert_bytes_to_ms(hw_ses->kw_end_idx, &hw_ses->config);
     ALOGD("%s:[%d] 1st stage kw_start = %dms, kw_end = %dms,"
-          "is_generic_event %d", __func__, st_ses->sm_handle,
-          kw_start_ms, kw_end_ms, hw_ses->is_generic_event);
+          "is_generic_event %d, channel_idx %d", __func__, st_ses->sm_handle,
+          kw_start_ms, kw_end_ms, hw_ses->is_generic_event, hw_ses->channel_idx);
 
     return 0;
 }
@@ -3330,7 +3360,7 @@ static int generate_legacy_st_phrase_recognition_event
  * params.
  */
 static size_t set_opaque_data_size(char *payload, size_t payload_size,
-    uint32_t version)
+    uint32_t version, void *platform)
 {
     size_t count_size = 0, opaque_size = 0;
     uint32_t key_id = 0, key_payload_size = 0;
@@ -3349,6 +3379,10 @@ static size_t set_opaque_data_size(char *payload, size_t payload_size,
                 opaque_size +=
                     sizeof(struct st_confidence_levels_info_v2);
             }
+
+            if (platform_is_best_channel_index_supported(platform))
+                opaque_size += sizeof(struct st_param_header) +
+                    sizeof(struct st_channel_index_info);
 
             opaque_size += sizeof(struct st_param_header) +
                 sizeof(struct st_keyword_indices_info);
@@ -3377,6 +3411,11 @@ static size_t set_opaque_data_size(char *payload, size_t payload_size,
                 sizeof(struct st_timestamp_info);
             break;
 
+        case KEY_ID_KEYWORD_CHANNEL_INDEX:
+            opaque_size += sizeof(struct st_param_header) +
+                sizeof(struct st_channel_index_info);
+            break;
+
         default:
             ALOGE("%s: Unsupported generic detection event key id", __func__);
             break;
@@ -3384,7 +3423,6 @@ static size_t set_opaque_data_size(char *payload, size_t payload_size,
         count_size += GENERIC_DET_EVENT_HEADER_SIZE + key_payload_size;
         payload += GENERIC_DET_EVENT_HEADER_SIZE + key_payload_size;
     }
-
     return opaque_size;
 }
 
@@ -3564,6 +3602,7 @@ static int parse_generic_event_and_pack_opaque_data(
     uint32_t timestamp_msw = 0, timestamp_lsw = 0;
     struct st_param_header *param_hdr = NULL;
     struct st_keyword_indices_info *kw_indices = NULL;
+    struct st_channel_index_info *chan_info = NULL;
     struct st_timestamp_info *timestamps = NULL;
     size_t count_size = 0;
     st_arm_second_stage_t *st_sec_stage = NULL;
@@ -3652,6 +3691,18 @@ static int parse_generic_event_and_pack_opaque_data(
                 timestamps->second_stage_det_event_time =
                     st_ses->hw_ses_current->second_stage_det_event_time;
             opaque_data += sizeof(struct st_timestamp_info);
+
+            if (platform_is_best_channel_index_supported(st_ses->stdev->platform)) {
+                /* set best channel idx */
+                param_hdr = (struct st_param_header *)opaque_data;
+                param_hdr->key_id = ST_PARAM_KEY_CHANNEL_INDEX;
+                param_hdr->payload_size = sizeof(struct st_channel_index_info);
+                opaque_data += sizeof(struct st_param_header);
+                chan_info = (struct st_channel_index_info *)opaque_data;
+                chan_info->version = 0x1;
+                chan_info->channel_index = result_info->best_channel_idx;
+                opaque_data += sizeof(struct st_channel_index_info);
+            }
             break;
 
         case KEY_ID_CONFIDENCE_LEVELS:
@@ -3723,6 +3774,18 @@ static int parse_generic_event_and_pack_opaque_data(
                 timestamps->second_stage_det_event_time =
                     st_ses->hw_ses_current->second_stage_det_event_time;
             opaque_data += sizeof(struct st_timestamp_info);
+            break;
+
+        case KEY_ID_KEYWORD_CHANNEL_INDEX:
+            /* Pack the opaque data keyword indices structure */
+            param_hdr = (struct st_param_header *)opaque_data;
+            param_hdr->key_id = ST_PARAM_KEY_CHANNEL_INDEX;
+            param_hdr->payload_size = sizeof(struct st_channel_index_info);
+            opaque_data += sizeof(struct st_param_header);
+            chan_info = (struct st_channel_index_info *)opaque_data;
+            chan_info->version = 0x1;
+            chan_info->channel_index = *((uint32_t *)payload + 3);
+            opaque_data += sizeof(struct st_channel_index_info);
             break;
 
         default:
@@ -3803,7 +3866,7 @@ int process_detection_event_keyphrase_v2(
 
     if (st_ses->vendor_uuid_info->is_qcva_uuid)
         opaque_size = set_opaque_data_size(payload, payload_size,
-            stc_ses->conf_levels_intf_version);
+            stc_ses->conf_levels_intf_version, stc_ses->stdev->platform);
     else
         opaque_size = payload_size;
 
@@ -4337,7 +4400,25 @@ static void *aggregator_thread_loop(void *st_session)
         }
 
         if (!IS_SS_DETECTION_PENDING(det_status)) {
-            pthread_mutex_lock(&st_ses->lock);
+            /*
+             * The client could unload the sound model at this time, which would wait
+             * for ss_detections_lock as part of st_session_deinit() with st_session_lock
+             * held. Before waiting for ss_detections_lock, the exit_aggregator_loop flag
+             * will be set to true, so this thread can exit in that scenario and avoid
+             * deadlock.
+             */
+            do {
+                lock_status = pthread_mutex_trylock(&st_ses->lock);
+            } while (lock_status && !st_ses->exit_aggregator_loop);
+
+            if (st_ses->exit_aggregator_loop) {
+                ALOGV("%s:[%d] client unloaded, lock status %d",
+                    __func__, st_ses->sm_handle, lock_status);
+                if (!lock_status)
+                    pthread_mutex_unlock(&st_ses->lock);
+                goto exit;
+            }
+
             /*
              * If the client stops before 2nd stage finishes processing, or a
              * transition is in progress, the detection event should not be
@@ -5005,6 +5086,12 @@ static int loaded_state_fn(st_proxy_session_t *st_ses, st_session_ev_t *ev)
             }
             break;
         }
+
+        if (stc_ses->pending_client_start) {
+            ALOGV("%s: Session not resuming due to client c%d buffering",
+                __func__, stc_ses->sm_handle);
+            break;
+        }
         /* Fall through */
     case ST_SES_EV_START:
     case ST_SES_EV_RESTART:
@@ -5540,10 +5627,13 @@ static int active_state_fn(st_proxy_session_t *st_ses, st_session_ev_t *ev)
         break;
 
     case ST_SES_EV_SET_DEVICE:
-        if (!ev->payload.enable)
+        if (!ev->payload.enable) {
+            st_ses->device_disabled = true;
             status = hw_ses->fptrs->disable_device(hw_ses, true);
-        else
+        } else {
             status = hw_ses->fptrs->enable_device(hw_ses, true);
+            st_ses->device_disabled = false;
+        }
 
         if (status && st_ses->stdev->ssr_offline_received) {
             STATE_TRANSITION(st_ses, ssr_state_fn);
@@ -5873,6 +5963,15 @@ static int buffering_state_fn(st_proxy_session_t *st_ses, st_session_ev_t *ev)
         /* Fall through */
     case ST_SES_EV_PAUSE:
         hw_ses->fptrs->stop_buffering(hw_ses);
+        /*
+         * The flag pending_client_start is used to prevent resume events from moving
+         * the session back to active state while the client is still buffering.
+         * Further detections while the client is buffering result in errors in the
+         * middleware state machine. When done buffering, the client can move the
+         * session back to active state when it calls start recognition.
+         */
+        if (stc_ses->detection_sent)
+            stc_ses->pending_client_start = true;
         STATE_TRANSITION(st_ses, active_state_fn);
         DISPATCH_EVENT(st_ses, *ev, status);
         if (st_ses->stdev->enable_debug_dumps &&
@@ -5910,7 +6009,6 @@ static int buffering_state_fn(st_proxy_session_t *st_ses, st_session_ev_t *ev)
     case ST_SES_EV_RESTART:
         ALOGD("%s:[c%d-%d] handle event START/RESTART", __func__,
             stc_ses->sm_handle, st_ses->sm_handle);
-
         if (stc_ses != st_ses->det_stc_ses) {
             ALOGD("%s: c%d buffering, delay c%d start", __func__,
                 st_ses->det_stc_ses->sm_handle, stc_ses->sm_handle);
@@ -6292,6 +6390,16 @@ int st_session_start(st_session_t *stc_ses)
         hw_session_notifier_cancel(stc_ses->sm_handle, ST_SES_EV_DEFERRED_STOP);
         stc_ses->pending_stop = false;
     }
+    stc_ses->pending_client_start = false;
+    /*
+     * detection_sent flag is set to false when successful detection
+     * happens and it will be set to true once client is notified of it.
+     * It remains true till the next detection happens. So make it false
+     * here, before we call into start/restart for next detection.
+     * Setting this flag false helps when we post pause event during
+     * buffering to pause other clients due to backend config change.
+     */
+     stc_ses->detection_sent = false;
 
     DISPATCH_EVENT(st_ses, ev, status);
     if (!status) {
@@ -6340,6 +6448,16 @@ int st_session_restart(st_session_t *stc_ses)
         hw_session_notifier_cancel(stc_ses->sm_handle, ST_SES_EV_DEFERRED_STOP);
         stc_ses->pending_stop = false;
     }
+    stc_ses->pending_client_start = false;
+    /*
+     * detection_sent flag is set to false when successful detection
+     * happens and it will be set to true once client is notified of it.
+     * It remains true till the next detection happens. So make it false
+     * here, before we call into start/restart for next detection.
+     * Setting this flag false helps when we post pause event during
+     * buffering to pause other clients due to backend config change.
+     */
+    stc_ses->detection_sent = false;
 
     DISPATCH_EVENT(st_ses, ev, status);
     if (!status) {

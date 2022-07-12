@@ -59,6 +59,7 @@ typedef unsigned char __u8;
 #include <cutils/str_parms.h>
 #include <cutils/properties.h>
 #include <cutils/trace.h>
+#include <cutils/bitops.h>
 #include <dlfcn.h>
 #include <expat.h>
 #include <errno.h>
@@ -86,6 +87,7 @@ typedef unsigned char __u8;
 #define ST_PARAM_KEY_CONCURRENT_CAPTURE "concurrent_capture"
 #define ST_PARAM_KEY_CONCURRENT_VOICE_CALL "concurrent_voice_call"
 #define ST_PARAM_KEY_CONCURRENT_VOIP_CALL "concurrent_voip_call"
+#define ST_PARAM_KEY_BEST_CHANNEL_INDEX "enable_best_channel_index"
 
 
 #define ST_PARAM_KEY_FIRMWARE_IMAGE "firmware_image"
@@ -422,6 +424,8 @@ struct platform_data {
 
     char vendor_config_path[MIXER_PATH_MAX_LENGTH];
     char xml_file_path[MIXER_PATH_MAX_LENGTH];
+
+    bool enable_best_channel_idx;
 };
 
 
@@ -1160,6 +1164,14 @@ static int platform_set_common_config
     if (err >= 0) {
         str_parms_del(parms, ST_PARAM_KEY_ENABLE_DEBUG_DUMPS);
         stdev->enable_debug_dumps =
+            !strncasecmp(str_value, "true", 4) ? true : false;
+    }
+
+    err = str_parms_get_str(parms, ST_PARAM_KEY_BEST_CHANNEL_INDEX,
+                            str_value, sizeof(str_value));
+    if (err >= 0) {
+        str_parms_del(parms, ST_PARAM_KEY_BEST_CHANNEL_INDEX);
+        my_data->enable_best_channel_idx =
             !strncasecmp(str_value, "true", 4) ? true : false;
     }
 
@@ -2032,7 +2044,8 @@ static int platform_stdev_set_module_params
     if (my_data->xml_version < PLATFORM_XML_VERSION_0x0106) {
         ALOGE("%s: Unexpected platform xml version 0x%x, exiting", __func__,
             my_data->xml_version);
-        return -EINVAL;
+        ret = -EINVAL;
+        goto err_exit;
     }
 
     /* Get the last added vendor_info node */
@@ -2542,8 +2555,7 @@ static int platform_stdev_create_lsm_params
         return -ENOMEM;
     }
 
-    if (my_data->xml_version > PLATFORM_XML_VERSION_0x0105)
-        list_init(&lsm_params->module_params_list);
+    list_init(&lsm_params->module_params_list);
 
     list_add_tail(&sm_info->lsm_usecase_list, &lsm_params->list_node);
 
@@ -3333,7 +3345,11 @@ static void query_stdev_platform(struct platform_data *my_data,
         get_xml_file_path(my_data->xml_file_path, MIXER_PATH_FILE_NAME_WCD9340,
             my_data->vendor_config_path);
         strlcpy(mixer_path_xml, my_data->xml_file_path, MIXER_PATH_MAX_LENGTH);
+#ifdef ST_APE
+	my_data->stdev->is_gcs = false;
+#else
         my_data->stdev->is_gcs = true;
+#endif
     } else if (strstr(snd_card_name, "bg")) {
         get_xml_file_path(my_data->xml_file_path, MIXER_PATH_FILE_NAME_BG,
             my_data->vendor_config_path);
@@ -3653,7 +3669,7 @@ static void platform_stdev_send_adm_app_type_cfg(void *platform)
     struct mixer_ctl *ctl;
     struct listnode *p_node, *temp_node;
     struct adm_cfg_info *cfg_info;;
-    int app_type_cfg[ST_MAX_LENGTH_MIXER_CONTROL] = {-1};
+    long app_type_cfg[ST_MAX_LENGTH_MIXER_CONTROL] = {-1};
     int i, len = 0, num_app_types = 0;
     bool update;
 
@@ -3715,7 +3731,7 @@ static void platform_stdev_send_adm_app_type_cfg(void *platform)
     struct mixer_ctl *ctl;
     struct listnode *p_node, *temp_node;
     struct adm_cfg_info *cfg_info;;
-    int app_type_cfg[ST_MAX_LENGTH_MIXER_CONTROL] = {-1};
+    long app_type_cfg[ST_MAX_LENGTH_MIXER_CONTROL] = {-1};
     int i, len = 0, num_app_types = 0;
     bool update;
 
@@ -4129,12 +4145,16 @@ void *platform_stdev_init(sound_trigger_device_t *stdev)
 
     snd_card_name = mixer_get_name(stdev->mixer);
 
-    query_stdev_platform(my_data, snd_card_name, mixer_path_xml);
-    stdev->audio_route = audio_route_init(snd_card_num, mixer_path_xml);
-    if (!stdev->audio_route) {
-        ALOGE("%s: ERROR. Failed to init audio route controls, aborting.",
-                __func__);
-        goto cleanup;
+    stdev->shared_mixer =
+        property_get_bool("persist.vendor.audio.shared_mixer.enabled", false);
+    if (!stdev->shared_mixer) {
+        query_stdev_platform(my_data, snd_card_name, mixer_path_xml);
+        stdev->audio_route = audio_route_init(snd_card_num, mixer_path_xml);
+        if (!stdev->audio_route) {
+            ALOGE("%s: ERROR. Failed to init audio route controls, aborting.",
+                    __func__);
+            goto cleanup;
+        }
     }
     stdev->snd_card = snd_card_num;
 
@@ -5087,13 +5107,32 @@ bool platform_stdev_check_and_update_concurrency
             default:
                 break;
         }
-        if (stdev->conc_capture_supported)
-            concurrency_ses_allowed = stdev->session_allowed;
-        else if (stdev->tx_concurrency_active > 0)
+
+        /*
+         * This disablement of VOIP/Voice flags is needed for the following usecase:
+         *
+         * 1. VOIP/Voice and AR active.
+         * 2. VOIP/Voice stops - AHAL sends stream inactive events for each stream,
+         *    followed by the shared device inactive and device active events which
+         *    both have VOIP/voice usecase, followed by one stream active event for AR.
+         * 3. AR stops - stream and device inactive events with pcm capture usecase.
+         *
+         * In this usecase the VOIP/voice flags get stuck set to true, so reset them here.
+         */
+        if (stdev->tx_concurrency_active == 0) {
+            stdev->conc_voice_active = false;
+            stdev->conc_voip_active = false;
+        }
+        if ((!stdev->conc_capture_supported &&
+             stdev->tx_concurrency_active > 0) ||
+            (stdev->conc_capture_supported &&
+             ((!stdev->conc_voice_call_supported && stdev->conc_voice_active) ||
+              (!stdev->conc_voip_call_supported && stdev->conc_voip_active))))
             concurrency_ses_allowed = false;
-    } else {
-        /* handle CAPTURE_STREAM events */
-        ALOGI("%s: Received STREAM event, event type %d, usecase type %d",
+    } else if (event_type == AUDIO_EVENT_PLAYBACK_STREAM_ACTIVE ||
+               event_type == AUDIO_EVENT_PLAYBACK_STREAM_INACTIVE) {
+        /* handle PLAYBACK_STREAM events */
+        ALOGI("%s: Received PLAYBACK_STREAM event, event type %d, usecase type %d",
               __func__, event_type, config->u.usecase.type);
         switch (event_type) {
             case AUDIO_EVENT_PLAYBACK_STREAM_ACTIVE:
@@ -5106,39 +5145,61 @@ bool platform_stdev_check_and_update_concurrency
             default:
                 break;
         }
-        if (event_type == AUDIO_EVENT_PLAYBACK_STREAM_ACTIVE ||
-            event_type == AUDIO_EVENT_PLAYBACK_STREAM_INACTIVE) {
-            if (stdev->rx_concurrency_disabled &&
-                stdev->rx_concurrency_active > 0 &&
-                num_sessions > stdev->rx_conc_max_st_ses)
-                concurrency_ses_allowed = false;
-        }
-        if (concurrency_ses_allowed) {
-            if ((!stdev->conc_capture_supported &&
-                 stdev->tx_concurrency_active > 0) ||
-                (stdev->conc_capture_supported &&
-                 ((!stdev->conc_voice_call_supported && stdev->conc_voice_active) ||
-                  (!stdev->conc_voip_call_supported && stdev->conc_voip_active))))
-                concurrency_ses_allowed = false;
-        }
-    }
+        if (stdev->rx_concurrency_disabled &&
+            stdev->rx_concurrency_active > 0 &&
+            num_sessions > stdev->rx_conc_max_st_ses)
+            concurrency_ses_allowed = false;
 
-    /*
-     * This disablement of VOIP/Voice flags is needed for the following usecase:
-     *
-     * 1. VOIP/Voice and AR active.
-     * 2. VOIP/Voice stops - AHAL sends stream inactive events for each stream,
-     *    followed by the shared device inactive and device active events which
-     *    both have VOIP/voice usecase, followed by one stream active event for AR.
-     * 3. AR stops - stream and device inactive events with pcm capture usecase.
-     *
-     * In this usecase the VOIP/voice flags get stuck set to true, so reset them here.
-     */
-    if (stdev->tx_concurrency_active == 0) {
-        stdev->conc_voice_active = false;
-        stdev->conc_voip_active = false;
-    }
+        if (concurrency_ses_allowed)
+            concurrency_ses_allowed = stdev->session_allowed;
+    } else if (event_type == AUDIO_EVENT_CAPTURE_STREAM_ACTIVE ||
+               event_type == AUDIO_EVENT_CAPTURE_STREAM_INACTIVE) {
+        /* handle CAPTURE_STREAM events */
+        /*
+         * This handling is required in case of voice/voip call and
+         * audio-record are active. And one of the usecases stops then
+         * only stream capture events will be posted to ST HAL as
+         * shared device is still active. So we need to update the
+         * concurrency support depending on concurrency related flags.
+         */
+        ALOGI("%s: Received CAPTURE_STREAM event, event type %d, usecase type %d",
+              __func__, event_type, config->u.usecase.type);
 
+        switch (event_type) {
+            case AUDIO_EVENT_CAPTURE_STREAM_ACTIVE:
+                switch (config->u.usecase.type) {
+                    case USECASE_TYPE_VOICE_CALL:
+                        stdev->conc_voice_active = true;
+                        break;
+                    case USECASE_TYPE_VOIP_CALL:
+                        stdev->conc_voip_active = true;
+                        break;
+                    default:
+                        break;
+                }
+                break;
+            case AUDIO_EVENT_CAPTURE_STREAM_INACTIVE:
+                switch (config->u.usecase.type) {
+                    case USECASE_TYPE_VOICE_CALL:
+                        stdev->conc_voice_active = false;
+                        break;
+                    case USECASE_TYPE_VOIP_CALL:
+                        stdev->conc_voip_active = false;
+                        break;
+                    default:
+                        break;
+                }
+                break;
+            default:
+                break;
+        }
+        if ((!stdev->conc_capture_supported &&
+             stdev->tx_concurrency_active > 0) ||
+            (stdev->conc_capture_supported &&
+             ((!stdev->conc_voice_call_supported && stdev->conc_voice_active) ||
+              (!stdev->conc_voip_call_supported && stdev->conc_voip_active))))
+                   concurrency_ses_allowed = false;
+    }
     ALOGD("%s: dedicated path %d, reset backend %d, tx %d, rx %d,"
           " concurrency session%s allowed",
           __func__, platform_stdev_is_dedicated_sva_path(stdev->platform),
@@ -5832,7 +5893,7 @@ int platform_stdev_send_stream_app_type_cfg
     struct platform_data *my_data = (struct platform_data *)platform;
     sound_trigger_device_t *stdev = my_data->stdev;
     char mixer_ctl_name[ST_MAX_LENGTH_MIXER_CONTROL];
-    int app_type_cfg[ST_MAX_LENGTH_MIXER_CONTROL] = {0};
+    long app_type_cfg[ST_MAX_LENGTH_MIXER_CONTROL] = {0};
     int len = 0;
     struct mixer_ctl *ctl;
     int status = 0, acdb_id;
@@ -5946,6 +6007,7 @@ void platform_stdev_disable_stale_devices
     sound_trigger_device_t *stdev = my_data->stdev;
     char st_device_name[DEVICE_NAME_MAX_SIZE] = {0};
 
+    bool dev_disabled = false;
     /*
      * There can be stale devices while exec_mode is NONE with the
      * below usecase:
@@ -5970,8 +6032,11 @@ void platform_stdev_disable_stale_devices
                                                   st_device_name);
                 ATRACE_END();
                 --(stdev->dev_enable_cnt[i]);
+                dev_disabled = true;
             }
         }
+        if (!dev_disabled)
+            stdev->disable_stale = true;
         pthread_mutex_unlock(&stdev->ref_cnt_lock);
     }
 }
@@ -6040,11 +6105,12 @@ void platform_stdev_send_ec_ref_cfg
     struct platform_data *my_data = (struct platform_data *)platform;
     sound_trigger_device_t *stdev = my_data->stdev;
     struct sound_trigger_event_info event_info = {{0}, 0};
+    bool force_reset_ec = stdev->shared_mixer;
 
     if (is_ec_profile(profile_type)) {
         event_info.st_ec_ref_enabled = enable;
         // reset the pending active EC mixer ctls first
-        if (!stdev->audio_ec_enabled) {
+        if (!stdev->audio_ec_enabled && !force_reset_ec) {
             while (stdev->ec_reset_pending_cnt > 0) {
                 audio_route_reset_and_update_path(stdev->audio_route,
                         my_data->ec_ref_mixer_path);
@@ -6065,7 +6131,7 @@ void platform_stdev_send_ec_ref_cfg
         } else {
             stdev->audio_hal_cb(ST_EVENT_UPDATE_ECHO_REF, &event_info);
             /* avoid disabling echo if audio hal has enabled echo ref */
-            if (!stdev->audio_ec_enabled) {
+            if (!stdev->audio_ec_enabled || force_reset_ec) {
                 ALOGD("%s: reset echo ref %s", __func__,
                     my_data->ec_ref_mixer_path);
                 audio_route_reset_and_update_path(stdev->audio_route,
@@ -6500,4 +6566,11 @@ int platform_stdev_derive_mixer_ctl_from_backend
     strlcat(mixer_ctl_name, my_data->backend_dai_name, MIXER_PATH_MAX_LENGTH);
 
     return 0;
+}
+
+bool platform_is_best_channel_index_supported(void* platform)
+{
+    struct platform_data *my_data = (struct platform_data *)platform;
+
+    return my_data->enable_best_channel_idx;
 }

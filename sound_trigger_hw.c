@@ -45,6 +45,8 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ *Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #define LOG_TAG "sound_trigger_hw"
 #define ATRACE_TAG (ATRACE_TAG_HAL)
@@ -273,6 +275,7 @@ static bool is_any_session_buffering()
         p_ses = node_to_item(p_ses_node, st_session_t, list_node);
         if (st_session_is_buffering(p_ses)) {
             ALOGD("%s:[%d] session is buffering", __func__, p_ses->sm_handle);
+            stdev->is_buffering = true;
             return true;
         }
     }
@@ -807,7 +810,8 @@ static void handle_audio_concurrency(audio_event_type_t event_type,
         if (event_type == AUDIO_EVENT_CAPTURE_DEVICE_INACTIVE &&
             !platform_stdev_is_dedicated_sva_path(stdev->platform) &&
             platform_stdev_backend_reset_allowed(stdev->platform))
-            platform_stdev_disable_stale_devices(stdev->platform);
+            if (stdev->tx_concurrency_active == 0)
+                platform_stdev_disable_stale_devices(stdev->platform);
         pthread_mutex_unlock(&stdev->lock);
         return;
     }
@@ -883,6 +887,7 @@ static void handle_audio_concurrency(audio_event_type_t event_type,
                  * This is needed when the session goes to loaded state, then
                  * LPI/NLPI switch happens due to Rx event.
                  */
+                platform_stdev_reset_backend_cfg(stdev->platform);
                 platform_stdev_disable_stale_devices(stdev->platform);
                 list_for_each(p_ses_node, &stdev->sound_model_list) {
                     p_ses = node_to_item(p_ses_node, st_session_t, list_node);
@@ -940,6 +945,8 @@ static void handle_audio_concurrency(audio_event_type_t event_type,
                     st_session_pause(p_ses);
                 }
             }
+
+            platform_stdev_reset_backend_cfg(stdev->platform);
 
             list_for_each(p_ses_node, &stdev->sound_model_list) {
                 p_ses = node_to_item(p_ses_node, st_session_t, list_node);
@@ -1107,6 +1114,10 @@ static void switch_device()
         st_session_disable_device(p_ses);
     }
     sthw_extn_lpma_notify_event(LPMA_EVENT_DISABLE_DEVICE);
+    if (stdev->disable_stale) {
+        platform_stdev_disable_stale_devices(stdev->platform);
+        stdev->disable_stale = false;
+    }
 
     list_for_each(p_ses_node, &stdev->sound_model_list) {
         p_ses = node_to_item(p_ses_node, st_session_t, list_node);
@@ -1192,6 +1203,8 @@ static void handle_screen_status_change(audio_event_info_t* config)
             }
         }
 
+        platform_stdev_reset_backend_cfg(stdev->platform);
+
         list_for_each(p_ses_node, &stdev->sound_model_list) {
             p_ses = node_to_item(p_ses_node, st_session_t, list_node);
             if (p_ses && p_ses->exec_mode == ST_EXEC_MODE_ADSP) {
@@ -1243,6 +1256,8 @@ static void handle_battery_status_change(audio_event_info_t* config)
                 st_session_pause(p_ses);
             }
         }
+
+        platform_stdev_reset_backend_cfg(stdev->platform);
 
         list_for_each(p_ses_node, &stdev->sound_model_list) {
             p_ses = node_to_item(p_ses_node, st_session_t, list_node);
@@ -1557,8 +1572,8 @@ static void update_available_phrase_info
 
 static bool compare_recognition_config
 (
-   const struct sound_trigger_recognition_config *current_config,
-   struct sound_trigger_recognition_config *new_config
+   const struct sound_trigger_recognition_config *new_config,
+   struct sound_trigger_recognition_config *current_config
 )
 {
     unsigned int i = 0, j = 0;
@@ -1580,7 +1595,6 @@ static bool compare_recognition_config
         (current_config->capture_requested != new_config->capture_requested) ||
         (current_config->num_phrases != new_config->num_phrases) ||
         (current_config->data_size != new_config->data_size) ||
-        (current_config->data_offset != new_config->data_offset) ||
         (hw_properties_extended.header.version == SOUND_TRIGGER_DEVICE_API_VERSION_1_3 &&
          memcmp((char *) current_config + current_config->data_offset,
                (char *) new_config + sizeof(struct sound_trigger_recognition_config) +
@@ -1948,6 +1962,7 @@ static int stdev_load_sound_model(const struct sound_trigger_hw_device *dev,
     st_module_type_t sm_version = ST_MODULE_TYPE_GMM;
     struct listnode *node = NULL, *tmp_node = NULL;
     struct st_arm_second_stage *st_sec_stage = NULL;
+    stdev->disable_stale = false;
 
     ALOGD("%s", __func__);
     ATRACE_BEGIN("sthal: stdev_load_sound_model");
@@ -2840,16 +2855,16 @@ stdev_get_properties_extended(const struct sound_trigger_hw_device *dev)
         }
     }
 
-    pthread_mutex_unlock(&stdev->lock);
-    return prop_hdr;
-
 exit:
-    st_session_deinit(st_session);
+    if (st_session)
+        st_session_deinit(st_session);
 
 exit_1:
-    android_atomic_dec(&stdev->session_id);
-    free(st_session);
-    st_session = NULL;
+    if (st_session) {
+        android_atomic_dec(&stdev->session_id);
+        free(st_session);
+        st_session = NULL;
+    }
 
 exit_2:
     pthread_mutex_unlock(&stdev->lock);
@@ -2944,7 +2959,11 @@ static int stdev_open(const hw_module_t* module, const char* name,
     }
 
     stdev->device.common.tag = HARDWARE_DEVICE_TAG;
+#ifdef ST_DEVICE_API_VERSION_1_0
+    stdev->device.common.version = SOUND_TRIGGER_DEVICE_API_VERSION_1_0;
+#else
     stdev->device.common.version = SOUND_TRIGGER_DEVICE_API_VERSION_1_3;
+#endif
     stdev->device.common.module = (struct hw_module_t *) module;
     stdev->device.common.close = stdev_close;
     stdev->device.get_properties = stdev_get_properties;
@@ -2984,6 +3003,8 @@ static int stdev_open(const hw_module_t* module, const char* name,
     stdev->lpi_enable = false;
     stdev->vad_enable = false;
     stdev->audio_ec_enabled = false;
+    stdev->is_buffering = false;
+    stdev->disable_stale = false;
 
     pthread_mutex_init(&stdev->lock, (const pthread_mutexattr_t *) NULL);
     pthread_mutex_init(&stdev->ref_cnt_lock, (const pthread_mutexattr_t*)NULL);
@@ -2999,12 +3020,16 @@ static int stdev_open(const hw_module_t* module, const char* name,
     stdev_ref_cnt++;
     pthread_mutex_unlock(&stdev_init_lock);
 
+#ifdef ST_DEVICE_API_VERSION_1_0
+    hw_properties_extended.header.version = SOUND_TRIGGER_DEVICE_API_VERSION_1_0;
+#else
     get_base_properties(stdev);
     hw_properties_extended.header.size = sizeof(struct sound_trigger_properties_extended_1_3);
     hw_properties_extended.audio_capabilities = 0;
     hw_properties_extended.header.version = SOUND_TRIGGER_DEVICE_API_VERSION_1_3;
-
+#endif
     ATRACE_END();
+    ALOGD("%s: Exit ", __func__);
     return 0;
 
 exit_1:
@@ -3339,6 +3364,15 @@ int sound_trigger_hw_call_back(audio_event_type_t event,
             break;
         }
         handle_screen_status_change(config);
+        break;
+
+    case AUDIO_EVENT_ROUTE_INIT_DONE:
+        if (!config) {
+            ALOGE("%s: NULL config for AUDIO_EVENT_ROUTE_INIT_DONE", __func__);
+            ret = -EINVAL;
+            break;
+        }
+        stdev->audio_route = config->u.audio_route;
         break;
 
     default:

@@ -3,6 +3,7 @@
  * This file implements the hw session functionality specific to LSM HW
  *
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -258,6 +259,11 @@ static int lsm_set_module_params
 )
 {
     int status = 0;
+
+    if(!p_lsm_ses->pcm) {
+        ALOGE("%s: PCM is NULL", __func__);
+        return -EINVAL;
+    }
 
     ATRACE_BEGIN("sthal:lsm: pcm_ioctl sndrv_lsm_set_module_params_v2");
     status = pcm_ioctl(p_lsm_ses->pcm, SNDRV_LSM_SET_MODULE_PARAMS_V2, lsm_params);
@@ -527,7 +533,8 @@ static bool fill_lsm_det_event_type_params
    lsm_param_info_t *det_event_type_params,
    struct st_module_param_info *mparams,
    uint16_t stage_idx,
-   st_module_type_t version
+   st_module_type_t version,
+   st_hw_session_lsm_t *p_lsm_ses
 )
 {
     /* fill event type params */
@@ -539,6 +546,10 @@ static bool fill_lsm_det_event_type_params
         det_event_type->mode =
             DET_EVENT_CONFIDENCE_LEVELS_BIT | DET_EVENT_KEYWORD_INDEX_BIT |
             DET_EVENT_TIMESTAMP_INFO_BIT;
+
+    if ((version != ST_MODULE_TYPE_PDK5) &&
+        (platform_is_best_channel_index_supported(p_lsm_ses->common.stdev->platform)))
+        det_event_type->mode |= DET_EVENT_CHANNEL_INDEX_INFO_BIT;
 
     det_event_type_params->param_size = sizeof(*det_event_type);
     det_event_type_params->param_data = (unsigned char *)det_event_type;
@@ -1333,6 +1344,7 @@ static int allocate_lab_buffers_ape(st_hw_session_lsm_t* p_lsm_ses)
     pthread_create(&p_lsm_ses->buffer_thread, &attr,
         buffer_thread_loop, p_lsm_ses);
 
+    pthread_attr_destroy(&attr);
     return status;
 
 error_exit:
@@ -1420,7 +1432,7 @@ static int sound_trigger_set_device
                     p_ses->stdev->reset_backend &&
                     !is_hwmad_device) {
                     ALOGV("%s: conc capture supported, reset device controls (%x) = %s",
-                           __func__, p_ses->st_device, p_ses->st_device_name);
+                           __func__, p_ses->st_device, st_device_name);
                     audio_route_reset_and_update_path(p_ses->stdev->audio_route,
                         st_device_name);
                     if (0 < p_ses->stdev->dev_enable_cnt[ref_enable_idx])
@@ -1748,7 +1760,7 @@ static int ape_reg_sm(st_hw_session_t *p_ses, void *sm_data,
         stage_idx = LSM_STAGE_INDEX_FIRST + p_lsm_ses->num_stages - 1;
         if (fill_lsm_det_event_type_params(&det_event_type,
                     &param_info[0], mparams, stage_idx,
-                    p_ses->f_stage_version)) {
+                    p_ses->f_stage_version, p_lsm_ses)) {
             p_ses->is_generic_event = true;
 
             lsm_params.num_params = 1;
@@ -1758,7 +1770,7 @@ static int ape_reg_sm(st_hw_session_t *p_ses, void *sm_data,
             if (status) {
                 ALOGE("%s: ERROR. setting detection event type. status %d",
                       __func__, status);
-                goto sm_error;
+                goto det_event_err;
             }
         }
     }
@@ -1774,6 +1786,9 @@ static int ape_reg_sm(st_hw_session_t *p_ses, void *sm_data,
         status);
     return 0;
 
+det_event_err:
+    if (p_ses->f_stage_version == ST_MODULE_TYPE_PDK5)
+        p_ses->num_reg_sm--;
 sm_error:
     platform_ape_free_pcm_device_id(p_ses->stdev->platform, p_lsm_ses->pcm_id);
     if (p_lsm_ses->pcm) {
@@ -1900,14 +1915,19 @@ static int ape_dereg_sm(st_hw_session_t *p_ses, uint32_t model_id)
          * and lab control param bit was not set.
          * LAB_CONTROL params is optional only for single stage session.
          */
-        if ((p_lsm_ses->num_stages == 1) &&
-            !(p_lsm_ses->lsm_usecase.param_tag_tracker & PARAM_LAB_CONTROL_BIT)) {
-            ATRACE_BEGIN("sthal:lsm: pcm_ioctl sndrv_lsm_lab_control");
-            status = pcm_ioctl(p_lsm_ses->pcm, SNDRV_LSM_LAB_CONTROL, &buf_en);
-            ATRACE_END();
-            if (status)
-                ALOGE("%s: ERROR. SNDRV_LSM_LAB_CONTROL failed, status=%d",
-                      __func__, status);
+        if(p_lsm_ses->pcm) {
+            if ((p_lsm_ses->num_stages == 1) &&
+                !(p_lsm_ses->lsm_usecase.param_tag_tracker & PARAM_LAB_CONTROL_BIT)) {
+                ATRACE_BEGIN("sthal:lsm: pcm_ioctl sndrv_lsm_lab_control");
+                status = pcm_ioctl(p_lsm_ses->pcm, SNDRV_LSM_LAB_CONTROL, &buf_en);
+                ATRACE_END();
+                if (status)
+                    ALOGE("%s: ERROR. SNDRV_LSM_LAB_CONTROL failed, status=%d",
+                          __func__, status);
+            }
+        }
+        else {
+            ALOGE("%s: PCM is NULL", __func__);
         }
 
         /* Deallocate lab buffes if allocated during start_recognition */
@@ -2043,6 +2063,7 @@ static int ape_reg_sm_params(st_hw_session_t* p_ses,
     while (status && (retry_num < SOUND_TRIGGER_PCM_MAX_RETRY)) {
         usleep(SOUND_TRIGGER_PCM_SLEEP_WAIT);
         retry_num++;
+        pcm_stop(p_lsm_ses->pcm);
         ALOGI("%s: pcm_start retrying..status %d errno %d, retry cnt %d",
               __func__, status, errno, retry_num);
         status = pcm_start(p_lsm_ses->pcm);
@@ -3060,6 +3081,11 @@ static void request_exit_callback_thread(st_hw_session_lsm_t *p_lsm_ses)
     p_lsm_ses->exit_callback_thread = true;
     for (int i = 0; i < LSM_ABORT_RETRY_COUNT; i++) {
         ATRACE_BEGIN("sthal:lsm: pcm_ioctl sndrv_lsm_abort_event");
+        if(!p_lsm_ses->pcm) {
+            ALOGE("%s: PCM is NULL",__func__);
+            pthread_mutex_unlock(&p_lsm_ses->callback_thread_lock);
+            return;
+        }
         status = pcm_ioctl(p_lsm_ses->pcm, SNDRV_LSM_ABORT_EVENT);
         ATRACE_END();
         GET_WAIT_TIMESPEC(timeout, LSM_ABORT_WAIT_TIMEOUT_NS);

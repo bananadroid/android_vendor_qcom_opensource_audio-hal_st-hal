@@ -3,7 +3,7 @@
  * This file contains the API to load sound models with
  * DSP and start/stop detection of associated key phrases.
  *
- * Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2021, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -52,14 +52,9 @@
 
 #define AUDIO_HAL_NAME_PREFIX "audio.primary"
 
-#if LINUX_ENABLED
- #ifdef __LP64__
-    #define AUDIO_HAL_LIBRARY_PATH1 "/usr/lib64"
-    #define AUDIO_HAL_LIBRARY_PATH2 AUDIO_HAL_LIBRARY_PATH1
- #else
-    #define AUDIO_HAL_LIBRARY_PATH1 "/usr/lib"
-    #define AUDIO_HAL_LIBRARY_PATH2 AUDIO_HAL_LIBRARY_PATH1
- #endif
+#ifdef HAL_LIBRARY_PATH
+    #define AUDIO_HAL_LIBRARY_PATH1 HAL_LIBRARY_PATH
+    #define AUDIO_HAL_LIBRARY_PATH2 HAL_LIBRARY_PATH
 #else
  #ifdef __LP64__
     #define AUDIO_HAL_LIBRARY_PATH1 "/vendor/lib64/hw"
@@ -215,7 +210,9 @@ struct sound_trigger_device {
     bool dedicated_sva_path;
     bool dedicated_headset_path;
     bool disable_hwmad;
+    bool is_buffering;
     st_platform_lpi_enable_t platform_lpi_enable;
+    bool disable_stale;
 
     unsigned int rx_conc_max_st_ses;
     struct use_case_info *ape_pcm_use_cases;
@@ -261,6 +258,7 @@ struct sound_trigger_device {
     bool screen_off;
     bool barge_in_mode;
     int ec_reset_pending_cnt;
+    bool shared_mixer;
 };
 
 typedef struct sound_trigger_device sound_trigger_device_t;
